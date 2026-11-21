@@ -1,0 +1,27 @@
+import mongoose from "mongoose";
+
+const StoreSettingsSchema = new mongoose.Schema(
+  {
+    key: { type: String, unique: true, default: "main" },
+    general: mongoose.Schema.Types.Mixed,
+    maintenance: mongoose.Schema.Types.Mixed,
+    appearance: mongoose.Schema.Types.Mixed,
+    storefront: mongoose.Schema.Types.Mixed,
+    payments: mongoose.Schema.Types.Mixed,
+    shipping: mongoose.Schema.Types.Mixed,
+    inventory: mongoose.Schema.Types.Mixed,
+    orders: mongoose.Schema.Types.Mixed,
+    consultations: mongoose.Schema.Types.Mixed,
+    training: mongoose.Schema.Types.Mixed,
+    blog: mongoose.Schema.Types.Mixed,
+    seo: mongoose.Schema.Types.Mixed,
+    notifications: mongoose.Schema.Types.Mixed,
+    security: mongoose.Schema.Types.Mixed,
+    donation: mongoose.Schema.Types.Mixed,
+    socialLinks: mongoose.Schema.Types.Mixed,
+    socialMedia: mongoose.Schema.Types.Mixed,
+  },
+  { timestamps: true, versionKey: false, strict: false }
+);
+
+export default mongoose.models.StoreSettings || mongoose.model("StoreSettings", StoreSettingsSchema);
