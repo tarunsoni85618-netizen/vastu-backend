@@ -14,8 +14,8 @@ const router = Router();
 router.get("/pricing", getConsultationPricingHandler);
 router.get("/single", getSingleConsultation);
 router.post("/resolve-location", resolveLocationAndDistance);
-router.post("/", bookAppointment);
-router.post("/initiate-payu", initiateAppointmentPayment);
+router.post("/", requireUser, bookAppointment);
+router.post("/initiate-payu", requireUser, initiateAppointmentPayment);
 router.get("/my", requireUser, getMyConsultations);
 
 export default router;

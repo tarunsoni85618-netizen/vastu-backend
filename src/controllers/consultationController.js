@@ -395,6 +395,12 @@ export async function getMyConsultations(req, res) {
 export async function initiateAppointmentPayment(req, res) {
   try {
     await connectDB();
+    if (!req.user) {
+      return res.status(401).json({
+        success: false,
+        error: "Please login with your mobile number to book a consultation.",
+      });
+    }
     const body = req.body || {};
     const name = String(body.name || "").trim();
     const phone = String(body.phone || "").replace(/\D/g, "");
@@ -494,11 +500,14 @@ export async function initiateAppointmentPayment(req, res) {
       reference,
       documentNo,
       clientId,
+      customer: mongoose.isValidObjectId(req.user?._id || req.user?.id)
+        ? (req.user._id || req.user.id)
+        : undefined,
       name,
       fatherOrSpouseName,
       email,
       phone,
-      userPhone: phone,
+      userPhone: req.user?.phone ? String(req.user.phone).replace(/\D/g, "") : phone,
       residentialAddress,
       state,
       occupation,
