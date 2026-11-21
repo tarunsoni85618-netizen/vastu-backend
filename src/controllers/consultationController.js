@@ -585,7 +585,7 @@ export async function initiateAppointmentPayment(req, res) {
         udf4: "",
         udf5: "",
         hash,
-        action: getPayUEndpoint(),
+        action: getPayUEndpoint(req),
       },
     });
   } catch (error) {

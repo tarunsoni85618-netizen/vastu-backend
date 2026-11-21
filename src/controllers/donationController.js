@@ -1,6 +1,6 @@
 import { connectDB } from "../lib/dbConnect.js";
 import Donation from "../models/Donation.js";
-import { generatePayUHash, verifyPayUResponse } from "../lib/payu.js";
+import { generatePayUHash, verifyPayUResponse, getPayUEndpoint } from "../lib/payu.js";
 
 export async function initiateDonation(req, res) {
   try {
@@ -58,7 +58,8 @@ export async function initiateDonation(req, res) {
       success: true,
       donationId,
       txnid,
-      actionUrl: "https://test.payu.in/_payment",
+      actionUrl: getPayUEndpoint(req),
+      action: getPayUEndpoint(req),
       payuParams: {
         key,
         txnid,

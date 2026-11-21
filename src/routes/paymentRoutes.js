@@ -7,11 +7,15 @@ import {
   verifyOrderPayment,
   createCodOrder,
   handlePayUResponse,
+  renderPayUGateway,
 } from "../controllers/paymentController.js";
 import { getMyOrders } from "../controllers/orderController.js";
 import { requireUser, optionalUser } from "../lib/auth.js";
 
 const router = Router();
+
+// PayU Gateway Simulator (GET & POST)
+router.all("/payu/gateway", renderPayUGateway);
 
 // PayU Response Callback (POST from PayU gateway)
 router.post("/payu/response", handlePayUResponse);
