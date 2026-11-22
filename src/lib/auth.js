@@ -55,11 +55,12 @@ export async function requireAdmin(req, res, next) {
 
 export async function requireUser(req, res, next) {
   const token = extractToken(req);
+  console.log("token", token, "req", req.headers)
 
   if (!token || !process.env.AUTH_SECRET) {
     return res.status(401).json({ success: false, error: "Authentication required" });
   }
-
+ 
   try {
     const payload = await verifyToken(token);
     if (!payload || !payload.sub) {

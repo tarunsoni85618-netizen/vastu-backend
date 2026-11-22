@@ -1,6 +1,8 @@
+import mongoose from "mongoose";
 import { connectDB } from "../lib/dbConnect.js";
 import Donation from "../models/Donation.js";
-import { generatePayUHash, verifyPayUResponse, getPayUEndpoint } from "../lib/payu.js";
+import { createRazorpayOrder, verifyRazorpaySignature } from "../lib/razorpay.js";
+import { getPaymentSuccessUrl, getPaymentFailureUrl } from "../lib/redirects.js";
 
 export async function initiateDonation(req, res) {
   try {
@@ -13,7 +15,13 @@ export async function initiateDonation(req, res) {
       });
     }
 
-    const numAmount = Math.max(1, Number(amount) || 0);
+    const numAmount = Number(amount) || 0;
+    if (numAmount < 10) {
+      return res.status(400).json({
+        success: false,
+        error: "Minimum donation amount is ₹10",
+      });
+    }
     const cleanedPhone = donorPhone.replace(/\D/g, "").slice(-10);
     if (cleanedPhone.length < 10) {
       return res.status(400).json({
@@ -26,6 +34,16 @@ export async function initiateDonation(req, res) {
     const donationId = `BSV-NGO-${Date.now().toString().slice(-6)}`;
     const txnid = `TXN_DON_${Date.now()}_${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
 
+    const rzpOrder = await createRazorpayOrder({
+      amount: numAmount,
+      receipt: donationId,
+      notes: {
+        donationId,
+        type: "donation",
+        donorName: donorName.trim().slice(0, 40),
+      },
+    });
+
     const donation = await Donation.create({
       donationId,
       donorName: donorName.trim(),
@@ -37,42 +55,23 @@ export async function initiateDonation(req, res) {
       message: (message || "").trim(),
       txnid,
       paymentStatus: "pending",
-      paymentProvider: "payu",
-    });
-
-    const key = process.env.PAYU_KEY || "m6wAnh";
-    const surl = process.env.PAYU_SUCCESS_URL || "http://localhost:3001/api/payments/payu/response";
-    const furl = process.env.PAYU_FAILURE_URL || "http://localhost:3001/api/payments/payu/response";
-
-    const hash = generatePayUHash({
-      txnid,
-      amount: numAmount,
-      productinfo: "Choti Khushi NGO Bird Feeding",
-      firstname: donorName.trim(),
-      email: (donorEmail || "donor@example.com").trim(),
-      udf1: donationId,
-      udf2: "donation",
+      paymentProvider: "online",
+      paymentReference: rzpOrder?.orderId || txnid,
     });
 
     return res.json({
       success: true,
+      provider: "razorpay",
+      keyId: rzpOrder.keyId,
+      orderId: rzpOrder.orderId,
+      amount: rzpOrder.amount,
+      currency: rzpOrder.currency,
       donationId,
       txnid,
-      actionUrl: getPayUEndpoint(req),
-      action: getPayUEndpoint(req),
-      payuParams: {
-        key,
-        txnid,
-        amount: numAmount.toFixed(2),
-        productinfo: "Choti Khushi NGO Bird Feeding",
-        firstname: donorName.trim(),
+      customer: {
+        name: donorName.trim(),
         email: (donorEmail || "donor@example.com").trim(),
         phone: cleanedPhone,
-        surl,
-        furl,
-        hash,
-        udf1: donationId,
-        udf2: "donation",
       },
     });
   } catch (error) {
@@ -81,17 +80,111 @@ export async function initiateDonation(req, res) {
   }
 }
 
+/**
+ * Verify Razorpay payment for Donation
+ */
+export async function verifyDonationPayment(req, res) {
+  try {
+    await connectDB();
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      donationId,
+      txnid,
+    } = req.body || {};
+
+    const donation = await Donation.findOne({
+      $or: [
+        ...(donationId ? [{ donationId }] : []),
+        ...(txnid ? [{ txnid }] : []),
+        ...(razorpay_order_id ? [{ paymentReference: razorpay_order_id }] : []),
+      ],
+    });
+
+    if (!donation) {
+      return res.status(404).json({ success: false, error: "Donation record not found" });
+    }
+
+    if (donation.paymentStatus === "paid") {
+      const redirectUrl = getPaymentSuccessUrl({
+        type: "donation",
+        status: "success",
+        donationId: donation.donationId,
+        amount: donation.amount,
+        txnid: donation.paymentReference,
+      });
+      return res.json({
+        success: true,
+        message: "Donation already verified",
+        redirectUrl,
+        donation,
+      });
+    }
+
+    const isValid = verifyRazorpaySignature({
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    });
+
+    if (!isValid) {
+      donation.paymentStatus = "failed";
+      await donation.save();
+      const redirectUrl = getPaymentFailureUrl({
+        type: "donation",
+        status: "failed",
+        donationId: donation.donationId,
+        error: "Payment verification failed",
+      });
+      return res.status(400).json({
+        success: false,
+        error: "Payment verification failed",
+        redirectUrl,
+      });
+    }
+
+    donation.paymentStatus = "paid";
+    donation.paymentProvider = "online";
+    donation.paymentReference = razorpay_payment_id || razorpay_order_id || txnid;
+    await donation.save();
+
+    const redirectUrl = getPaymentSuccessUrl({
+      type: "donation",
+      status: "success",
+      donationId: donation.donationId,
+      amount: donation.amount,
+      txnid: donation.paymentReference,
+    });
+
+    return res.json({
+      success: true,
+      message: "Donation payment verified successfully!",
+      redirectUrl,
+      donation,
+    });
+  } catch (err) {
+    console.error("verifyDonationPayment error:", err);
+    return res.status(500).json({ success: false, error: "Verification server error" });
+  }
+}
+
 export async function getMyDonations(req, res) {
   try {
     await connectDB();
-    if (!req.user) {
+    const phoneParam = req.query?.phone ? String(req.query.phone).replace(/\D/g, "") : "";
+    const userPhone = req.user?.phone ? String(req.user.phone).replace(/\D/g, "").slice(-10) : (phoneParam.length >= 10 ? phoneParam.slice(-10) : "");
+    const userEmail = req.user?.email ? String(req.user.email).trim().toLowerCase() : (req.query?.email ? String(req.query.email).trim().toLowerCase() : "");
+    const userId = req.user?.id || req.user?._id;
+
+    if (!userId && !userPhone && !userEmail) {
       return res.status(401).json({ success: false, error: "Authentication required" });
     }
 
-    const userPhone = req.user?.phone ? String(req.user.phone).replace(/\D/g, "").slice(-10) : "";
-    const userEmail = req.user?.email ? String(req.user.email).trim().toLowerCase() : "";
-
     const conditions = [];
+    if (userId && mongoose.isValidObjectId(userId)) {
+      conditions.push({ donor: new mongoose.Types.ObjectId(userId) });
+    }
     if (userPhone && userPhone.length >= 10) {
       conditions.push({ donorPhone: { $regex: new RegExp(userPhone + "$") } });
     }

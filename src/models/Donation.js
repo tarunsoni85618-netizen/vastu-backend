@@ -24,6 +24,7 @@ const DonationSchema = new mongoose.Schema(
     amount: {
       type: Number,
       required: true,
+      min: [10, "Minimum donation amount is ₹10"],
     },
     currency: {
       type: String,
@@ -49,7 +50,7 @@ const DonationSchema = new mongoose.Schema(
     },
     paymentProvider: {
       type: String,
-      default: "payu",
+      default: "online",
     },
     txnid: {
       type: String,

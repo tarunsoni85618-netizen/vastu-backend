@@ -71,7 +71,7 @@ const EnrollmentSchema = new mongoose.Schema(
     },
     paymentProvider: {
       type: String,
-      default: "payu",
+      default: "online",
     },
     txnid: {
       type: String,

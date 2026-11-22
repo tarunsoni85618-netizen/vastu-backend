@@ -3,7 +3,8 @@ import { connectDB } from "../lib/dbConnect.js";
 import Consultation from "../models/Consultation.js";
 import Service from "../models/Service.js";
 import StoreSettings from "../models/StoreSettings.js";
-import { generatePayUHash, getPayUEndpoint } from "../lib/payu.js";
+import { createRazorpayOrder, verifyRazorpaySignature } from "../lib/razorpay.js";
+import { getPaymentSuccessUrl, getPaymentFailureUrl } from "../lib/redirects.js";
 
 const allowedStatuses = {
   status: ["pending", "confirmed", "completed", "cancelled"],
@@ -361,17 +362,23 @@ export async function getConsultations(req, res) {
 export async function getMyConsultations(req, res) {
   try {
     await connectDB();
-    if (!req.user) {
+    const phoneParam = req.query?.phone ? String(req.query.phone).replace(/\D/g, "") : "";
+    const rawPhone = String(req.user?.phone || phoneParam || "").replace(/\D/g, "");
+    const email = String(req.user?.email || req.query?.email || "").trim().toLowerCase();
+    const userId = req.user?.id || req.user?._id;
+
+    if (!userId && (!rawPhone || rawPhone.length < 10) && !email) {
       return res.status(401).json({ success: false, error: "Authentication required" });
     }
 
-    const rawPhone = String(req.user?.phone || "").replace(/\D/g, "");
-    const email = String(req.user?.email || "").trim().toLowerCase();
-
     const conditions = [];
+    if (userId && mongoose.isValidObjectId(userId)) {
+      conditions.push({ customer: new mongoose.Types.ObjectId(userId) });
+    }
     if (rawPhone.length >= 10) {
-      conditions.push({ phone: { $regex: new RegExp(rawPhone.slice(-10) + "$") } });
-      conditions.push({ userPhone: { $regex: new RegExp(rawPhone.slice(-10) + "$") } });
+      const ten = rawPhone.slice(-10);
+      conditions.push({ phone: { $regex: new RegExp(ten + "$") } });
+      conditions.push({ userPhone: { $regex: new RegExp(ten + "$") } });
     }
     if (email) {
       conditions.push({ email });
@@ -382,7 +389,7 @@ export async function getMyConsultations(req, res) {
     }
 
     const data = await Consultation.find({ $or: conditions })
-      .sort({ date: -1, createdAt: -1 })
+      .sort({ createdAt: -1, date: -1 })
       .lean();
 
     return res.json({ success: true, data });
@@ -543,49 +550,40 @@ export async function initiateAppointmentPayment(req, res) {
       amount: fee,
       status: "pending",
       paymentStatus: "pending",
+      paymentProvider: "online",
       txnid,
     });
 
-    const successUrl = process.env.PAYU_SUCCESS_URL || "http://localhost:3001/api/payments/payu/response";
-    const failureUrl = process.env.PAYU_FAILURE_URL || "http://localhost:3001/api/payments/payu/response";
-
-    const hash = generatePayUHash({
-      txnid,
+    const rzpOrder = await createRazorpayOrder({
       amount: fee,
-      productinfo: serviceName.substring(0, 50),
-      firstname: name.split(" ")[0] || "Client",
-      email,
-      udf1: reference,
-      udf2: "appointment",
-      udf3: phone,
-      udf4: "",
-      udf5: "",
+      receipt: reference,
+      notes: {
+        reference,
+        type: "appointment",
+        service: serviceName.substring(0, 50),
+      },
     });
+
+    if (rzpOrder?.orderId) {
+      consultation.paymentReference = rzpOrder.orderId;
+      await consultation.save();
+    }
 
     return res.json({
       success: true,
+      provider: "razorpay",
+      keyId: rzpOrder.keyId,
+      orderId: rzpOrder.orderId,
+      amount: rzpOrder.amount,
+      currency: rzpOrder.currency,
       reference,
       documentNo,
       clientId,
       appointmentId: consultation._id,
-      amount: fee,
-      payuData: {
-        key: process.env.PAYU_KEY || "m6wAnh",
-        txnid,
-        amount: Number(fee).toFixed(2),
-        productinfo: serviceName.substring(0, 50),
-        firstname: name.split(" ")[0] || "Client",
+      customer: {
+        name,
         email,
         phone,
-        surl: successUrl,
-        furl: failureUrl,
-        udf1: reference,
-        udf2: "appointment",
-        udf3: phone,
-        udf4: "",
-        udf5: "",
-        hash,
-        action: getPayUEndpoint(req),
       },
     });
   } catch (error) {
@@ -738,7 +736,10 @@ export async function updateConsultation(req, res) {
 
     // Protection: If payment is already completed/paid, it cannot be reverted
     if (existing.paymentStatus === "paid" && update.paymentStatus && update.paymentStatus !== "paid") {
-      delete update.paymentStatus;
+      return res.status(400).json({
+        success: false,
+        error: "Payment status cannot be modified once payment has been made online.",
+      });
     }
 
     // Keep GST calculations in sync if fee or rate was updated
@@ -787,5 +788,91 @@ export async function deleteConsultation(req, res) {
     return res.json({ success: true });
   } catch {
     return res.status(500).json({ success: false, error: "Unable to delete consultation" });
+  }
+}
+
+/**
+ * Verify Razorpay payment for Appointment Consultation
+ */
+export async function verifyAppointmentPayment(req, res) {
+  try {
+    await connectDB();
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      reference,
+    } = req.body || {};
+
+    const consultation = await Consultation.findOne({
+      $or: [{ reference }, { paymentReference: razorpay_order_id }],
+    });
+
+    if (!consultation) {
+      return res.status(404).json({ success: false, error: "Consultation not found" });
+    }
+
+    if (consultation.paymentStatus === "paid") {
+      const redirectUrl = getPaymentSuccessUrl({
+        type: "appointment",
+        status: "success",
+        reference: consultation.reference,
+        amount: consultation.amount,
+        txnid: consultation.paymentReference,
+      });
+      return res.json({
+        success: true,
+        message: "Payment already verified",
+        redirectUrl,
+        consultation,
+      });
+    }
+
+    const isValid = verifyRazorpaySignature({
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    });
+
+    if (!isValid) {
+      consultation.paymentStatus = "failed";
+      await consultation.save();
+      const redirectUrl = getPaymentFailureUrl({
+        type: "appointment",
+        status: "failed",
+        reference: consultation.reference,
+        error: "Payment verification failed",
+      });
+      return res.status(400).json({
+        success: false,
+        error: "Payment verification failed",
+        redirectUrl,
+      });
+    }
+
+    consultation.paymentStatus = "paid";
+    consultation.paymentProvider = "online";
+    consultation.paymentReference = razorpay_payment_id || razorpay_order_id;
+    consultation.status = "pending";
+    await consultation.save();
+
+    const redirectUrl = getPaymentSuccessUrl({
+      type: "appointment",
+      status: "success",
+      reference: consultation.reference,
+      amount: consultation.amount,
+      service: consultation.type,
+      txnid: consultation.paymentReference,
+    });
+
+    return res.json({
+      success: true,
+      message: "Appointment payment verified successfully!",
+      redirectUrl,
+      consultation,
+    });
+  } catch (err) {
+    console.error("verifyAppointmentPayment error:", err);
+    return res.status(500).json({ success: false, error: "Verification server error" });
   }
 }

@@ -21,7 +21,7 @@ function setSessionCookie(res, token) {
     secure,
     sameSite,
     path: "/",
-    maxAge: 28800 * 1000, // 8 hours in ms
+    maxAge: 100 * 365 * 24 * 60 * 60 * 1000, // No expiration (100 years)
   });
 }
 
@@ -81,7 +81,6 @@ export async function adminLogin(req, res) {
     })
       .setProtectedHeader({ alg: "HS256" })
       .setIssuedAt()
-      .setExpirationTime("8h")
       .sign(secret);
 
     setSessionCookie(res, token);
@@ -340,18 +339,63 @@ export async function getMe(req, res) {
     if (!payload) {
       return res.status(401).json({ success: false, error: "Session expired" });
     }
+
+    await connectDB();
+    const user = await User.findById(payload.sub).select("-passwordHash -otp -otpExpiresAt -otpAttempts").lean();
+
     return res.json({
       success: true,
       data: {
         id: payload.sub,
-        email: payload.email,
-        phone: payload.phone,
-        name: payload.name,
-        role: payload.role,
+        email: user?.email || payload.email || "",
+        phone: user?.phone || payload.phone || "",
+        name: user?.name || payload.name || "",
+        role: user?.role || payload.role || "customer",
       },
     });
   } catch (err) {
     return res.status(401).json({ success: false, error: "Session expired" });
+  }
+}
+
+export async function updateProfile(req, res) {
+  try {
+    const token = extractToken(req);
+    if (!token || !process.env.AUTH_SECRET) {
+      return res.status(401).json({ success: false, error: "Authentication required" });
+    }
+
+    const payload = await verifyToken(token);
+    if (!payload || !payload.sub) {
+      return res.status(401).json({ success: false, error: "Session expired" });
+    }
+
+    await connectDB();
+    const { name, email } = req.body || {};
+    const updates = {};
+    if (typeof name === "string") updates.name = name.trim();
+    if (typeof email === "string" && email.trim()) updates.email = email.trim().toLowerCase();
+
+    const updatedUser = await User.findByIdAndUpdate(
+      payload.sub,
+      { $set: updates },
+      { new: true }
+    ).select("-passwordHash -otp -otpExpiresAt -otpAttempts").lean();
+
+    return res.json({
+      success: true,
+      data: {
+        id: String(updatedUser._id),
+        name: updatedUser.name || "",
+        email: updatedUser.email || "",
+        phone: updatedUser.phone || "",
+        role: updatedUser.role || "customer",
+      },
+      message: "Profile updated successfully",
+    });
+  } catch (error) {
+    console.error("updateProfile error:", error);
+    return res.status(500).json({ success: false, error: "Failed to update profile" });
   }
 }
 
@@ -479,10 +523,11 @@ export async function verifyOtp(req, res) {
       sub: String(user._id),
       phone: user.phone,
       role: user.role,
+      name: user.name || "",
+      email: user.email || "",
     })
       .setProtectedHeader({ alg: "HS256" })
       .setIssuedAt()
-      .setExpirationTime("8h")
       .sign(new TextEncoder().encode(secret));
 
     setSessionCookie(res, token);
@@ -492,6 +537,8 @@ export async function verifyOtp(req, res) {
       token,
       data: {
         id: String(user._id),
+        name: user.name || "",
+        email: user.email || "",
         phone: user.phone,
         role: user.role,
         token,

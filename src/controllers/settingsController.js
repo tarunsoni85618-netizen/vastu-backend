@@ -71,7 +71,7 @@ const DEFAULTS = {
     refundPolicy: "Refunds are reviewed according to the store's published refund policy.",
     mode: "test",
     onlinePaymentsEnabled: true,
-    provider: "payu",
+    provider: "online",
   },
   shipping: {
     shippingEnabled: true,

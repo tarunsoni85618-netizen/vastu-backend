@@ -1,10 +1,15 @@
 import { Router } from "express";
-import { initiateDonation, getMyDonations } from "../controllers/donationController.js";
-import { requireUser } from "../lib/auth.js";
+import {
+  initiateDonation,
+  verifyDonationPayment,
+  getMyDonations,
+} from "../controllers/donationController.js";
+import { requireUser, optionalUser } from "../lib/auth.js";
 
 const router = Router();
 
 router.post("/initiate", initiateDonation);
-router.get("/my-donations", requireUser, getMyDonations);
+router.post("/verify", verifyDonationPayment);
+router.get("/my-donations", optionalUser, getMyDonations);
 
 export default router;

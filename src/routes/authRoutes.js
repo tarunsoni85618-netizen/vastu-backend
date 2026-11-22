@@ -9,8 +9,9 @@ import {
   getMe,
   sendOtp,
   verifyOtp,
+  updateProfile,
 } from "../controllers/authController.js";
-import { requireAdmin } from "../lib/auth.js";
+import { requireAdmin, requireUser } from "../lib/auth.js";
 
 const router = Router();
 
@@ -25,6 +26,7 @@ router.post("/admin/reset-password", requireAdmin, adminChangePassword);
 router.post("/bootstrap-admin", bootstrapAdmin);
 router.post("/logout", logout);
 router.get("/me", getMe);
+router.put("/profile", requireUser, updateProfile);
 router.post("/otp/send", sendOtp);
 router.post("/otp/verify", verifyOtp);
 

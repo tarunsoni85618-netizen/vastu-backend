@@ -221,6 +221,18 @@ export async function updateAdminOrder(req, res) {
       });
     }
 
+    // Protection: Payment status cannot be changed once paid online
+    const isOnlinePaid =
+      existing.paymentStatus === "paid" &&
+      (existing.paymentProvider !== "cod" || Boolean(existing.paymentReference));
+
+    if (isOnlinePaid && b.paymentStatus !== undefined && b.paymentStatus !== "paid") {
+      return res.status(400).json({
+        success: false,
+        error: "Payment status cannot be modified once payment has been made online.",
+      });
+    }
+
     if (b.status === "delivered" && !existing.deliveredAt) {
       update.deliveredAt = new Date();
     }
@@ -390,13 +402,14 @@ export async function getAdminDuePayments(req, res) {
 export async function getMyOrders(req, res) {
   try {
     await connectDB();
-    if (!req.user) {
+    const phoneParam = req.query?.phone ? String(req.query.phone).replace(/\D/g, "") : "";
+    const phone = req.user?.phone ? String(req.user.phone).replace(/\D/g, "").slice(-10) : (phoneParam.length >= 10 ? phoneParam.slice(-10) : "");
+    const email = req.user?.email ? String(req.user.email).trim().toLowerCase() : (req.query?.email ? String(req.query.email).trim().toLowerCase() : "");
+    const userId = req.user?.id || req.user?._id;
+
+    if (!userId && !phone && !email) {
       return res.status(401).json({ success: false, error: "Authentication required" });
     }
-
-    const userId = req.user.id || req.user._id;
-    const phone = req.user.phone ? String(req.user.phone).replace(/\D/g, "").slice(-10) : "";
-    const email = req.user.email ? String(req.user.email).trim().toLowerCase() : "";
 
     const conditions = [];
 

@@ -48,12 +48,14 @@ export async function createTicket(req, res) {
 export async function getMyTickets(req, res) {
   try {
     await connectDB();
-    if (!req.user) {
+    const phoneParam = req.query?.phone ? String(req.query.phone).replace(/\D/g, "") : "";
+    const rawPhone = String(req.user?.phone || phoneParam || "").replace(/\D/g, "");
+    const email = String(req.user?.email || req.query?.email || "").trim().toLowerCase();
+    const userId = req.user?.id || req.user?._id;
+
+    if (!userId && (!rawPhone || rawPhone.length < 10) && !email) {
       return res.status(401).json({ success: false, error: "Authentication required" });
     }
-
-    const rawPhone = String(req.user?.phone || "").replace(/\D/g, "");
-    const email = String(req.user?.email || "").trim().toLowerCase();
 
     const conditions = [];
     if (rawPhone.length >= 10) {

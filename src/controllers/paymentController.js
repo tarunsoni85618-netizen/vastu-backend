@@ -8,11 +8,16 @@ import Consultation from "../models/Consultation.js";
 import Coupon from "../models/Coupon.js";
 import { verifyOrderCalculation } from "./couponController.js";
 import {
-  generatePayUHash,
-  verifyPayUResponse,
-  getPayUEndpoint,
-  isPayUConfigured,
-} from "../lib/payu.js";
+  createRazorpayOrder,
+  verifyRazorpaySignature,
+  isRazorpayConfigured,
+  getRazorpayKeyId,
+} from "../lib/razorpay.js";
+import {
+  getPaymentSuccessUrl,
+  getPaymentFailureUrl,
+  getFrontendUrl,
+} from "../lib/redirects.js";
 
 const DEFAULT_COURSE_WHATSAPP_LINKS = {
   "bhuwneshwari scientific vastu master class":
@@ -41,12 +46,14 @@ const digitsOnly = (v = "") => String(v).replace(/\D/g, "");
 export async function getMyEnrollments(req, res) {
   try {
     await connectDB();
-    if (!req.user) {
+    const phoneParam = req.query?.phone ? digitsOnly(req.query.phone).slice(-10) : "";
+    const phone = req.user?.phone ? digitsOnly(req.user.phone || "").slice(-10) : phoneParam;
+    const email = req.user?.email ? String(req.user.email).trim().toLowerCase() : (req.query?.email ? String(req.query.email).trim().toLowerCase() : "");
+    const userId = req.user?.id || req.user?._id;
+
+    if (!userId && (!phone || phone.length < 10) && !email) {
       return res.status(401).json({ success: false, error: "Authentication required" });
     }
-
-    const phone = digitsOnly(req.user.phone || "").slice(-10);
-    const email = req.user.email ? String(req.user.email).trim().toLowerCase() : "";
 
     const conditions = [];
     if (phone && phone.length >= 10) {
@@ -162,7 +169,7 @@ export async function initiateEnrollment(req, res) {
         amount: Number(amount),
         currency: "INR",
         paymentStatus: "pending",
-        paymentProvider: "payu",
+        paymentProvider: "online",
         txnid,
         whatsappLink,
         status: "active",
@@ -170,45 +177,37 @@ export async function initiateEnrollment(req, res) {
       { upsert: true, new: true }
     );
 
-    const firstname = (name.trim() || "Student").split(" ")[0];
-    const userEmail = email.trim() || "student@bhuwneshwarivastu.com";
-    const productinfo = `Training Enrollment: ${courseTitle.trim().slice(0, 50)}`;
-
-    const hash = generatePayUHash({
-      txnid,
+    const rzpOrder = await createRazorpayOrder({
       amount,
-      productinfo,
-      firstname,
-      email: userEmail,
-      udf1: enrollmentId,
-      udf2: "training",
+      receipt: enrollmentId,
+      notes: {
+        enrollmentId,
+        type: "training",
+        courseTitle: courseTitle.trim().slice(0, 50),
+      },
     });
 
-    const surl =
-      process.env.PAYU_SUCCESS_URL || "http://localhost:3000/payment-success";
-    const furl =
-      process.env.PAYU_FAILURE_URL || "http://localhost:3000/payment-failure";
+    if (rzpOrder?.orderId) {
+      await Enrollment.updateOne(
+        { enrollmentId },
+        { $set: { paymentReference: rzpOrder.orderId } }
+      );
+    }
 
     return res.json({
       success: true,
-      action: getPayUEndpoint(req),
-      isConfigured: isPayUConfigured(),
+      provider: "razorpay",
+      keyId: rzpOrder.keyId,
+      orderId: rzpOrder.orderId,
+      amount: rzpOrder.amount,
+      currency: rzpOrder.currency,
       enrollmentId,
       txnid,
       whatsappLink,
-      params: {
-        key: process.env.PAYU_KEY || "TEST_KEY",
-        txnid,
-        amount: Number(amount).toFixed(2),
-        productinfo,
-        firstname,
-        email: userEmail,
+      customer: {
+        name: name.trim(),
+        email: email.trim(),
         phone: cleanedPhone,
-        surl,
-        furl,
-        hash,
-        udf1: enrollmentId,
-        udf2: "training",
       },
     });
   } catch (error) {
@@ -220,23 +219,34 @@ export async function initiateEnrollment(req, res) {
 }
 
 /**
- * Verify PayU payment for Training enrollment
+ * Verify Razorpay payment for Training enrollment
  */
 export async function verifyEnrollment(req, res) {
   try {
     await connectDB();
     const data = req.body || {};
-    const { txnid, enrollmentId, status } = data;
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      txnid,
+      enrollmentId,
+    } = data;
 
-    if (!txnid && !enrollmentId) {
+    if (!txnid && !enrollmentId && !razorpay_order_id) {
       return res.status(400).json({
         success: false,
         error: "Missing transaction ID or enrollment ID",
       });
     }
 
-    const filter = txnid ? { txnid } : { enrollmentId };
-    const enrollment = await Enrollment.findOne(filter);
+    const enrollment = await Enrollment.findOne({
+      $or: [
+        ...(enrollmentId ? [{ enrollmentId }] : []),
+        ...(txnid ? [{ txnid }] : []),
+        ...(razorpay_order_id ? [{ paymentReference: razorpay_order_id }] : []),
+      ],
+    });
 
     if (!enrollment) {
       return res
@@ -245,40 +255,62 @@ export async function verifyEnrollment(req, res) {
     }
 
     if (enrollment.paymentStatus === "paid") {
+      const redirectUrl = getPaymentSuccessUrl({
+        type: "training",
+        status: "success",
+        enrollmentId: enrollment.enrollmentId,
+        course: enrollment.courseTitle,
+        txnid: enrollment.paymentReference,
+      });
       return res.json({
         success: true,
         message: "Enrollment is already verified and active",
         enrollment,
+        redirectUrl,
       });
     }
 
-    const isValid = verifyPayUResponse(data);
-    if (!isValid && status !== "success") {
+    const isValid = verifyRazorpaySignature({
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    });
+
+    if (!isValid) {
       enrollment.paymentStatus = "failed";
       await enrollment.save();
+      const redirectUrl = getPaymentFailureUrl({
+        type: "training",
+        status: "failed",
+        enrollmentId: enrollment.enrollmentId,
+        error: "Payment verification failed",
+      });
       return res
         .status(400)
-        .json({ success: false, error: "Payment verification failed" });
+        .json({ success: false, error: "Payment verification failed", redirectUrl });
     }
 
     enrollment.paymentStatus = "paid";
-    enrollment.paymentReference =
-      data.payuMoneyId || data.mihpayid || data.bank_ref_num || txnid;
+    enrollment.paidAmount = enrollment.amount;
+    enrollment.dueAmount = 0;
+    enrollment.paymentType = "full";
+    enrollment.paymentProvider = "online";
+    enrollment.paymentReference = razorpay_payment_id || razorpay_order_id || txnid;
     await enrollment.save();
+
+    const redirectUrl = getPaymentSuccessUrl({
+      type: "training",
+      status: "success",
+      enrollmentId: enrollment.enrollmentId,
+      course: enrollment.courseTitle,
+      txnid: enrollment.paymentReference,
+    });
 
     return res.json({
       success: true,
       message: "Payment successfully verified! Enrollment active.",
-      enrollment: {
-        enrollmentId: enrollment.enrollmentId,
-        courseTitle: enrollment.courseTitle,
-        amount: enrollment.amount,
-        currency: enrollment.currency,
-        whatsappLink: enrollment.whatsappLink,
-        userName: enrollment.userName,
-        userPhone: enrollment.userPhone,
-        enrolledAt: enrollment.updatedAt,
-      },
+      enrollment,
+      redirectUrl,
     });
   } catch (error) {
     console.error("verifyEnrollment error:", error);
@@ -341,6 +373,15 @@ export async function initiateOrderPayment(req, res) {
 
     const gstinValue = String(buyerGstin || customer.buyerGstin || customer.gstin || "").trim();
 
+    const rzpOrder = await createRazorpayOrder({
+      amount: verified.verifiedTotal,
+      receipt: orderNumber,
+      notes: {
+        orderNumber,
+        type: "order",
+      },
+    });
+
     // Create pending order with verified amounts
     const newOrder = await Order.create({
       orderNumber,
@@ -367,8 +408,8 @@ export async function initiateOrderPayment(req, res) {
       },
       status: "pending",
       paymentStatus: "pending",
-      paymentProvider: "payu",
-      paymentReference: txnid,
+      paymentProvider: "online",
+      paymentReference: rzpOrder.orderId || txnid,
       trackingNumber: "",
     });
 
@@ -376,33 +417,22 @@ export async function initiateOrderPayment(req, res) {
       .trim()
       .split(" ")[0];
     const email = customer.email?.trim() || "orders@bhuwneshwarivastu.com";
-    const productinfo = `BSV Order ${orderNumber} (${verified.verifiedItems.length} items)`.slice(
-      0,
-      50
-    );
-
-    const hash = generatePayUHash({
-      txnid,
-      amount: verified.verifiedTotal,
-      productinfo,
-      firstname,
-      email,
-      udf1: orderNumber,
-      udf2: "order",
-    });
-
-    const surl =
-      process.env.PAYU_SUCCESS_URL || "http://localhost:3000/payment-success";
-    const furl =
-      process.env.PAYU_FAILURE_URL || "http://localhost:3000/payment-failure";
 
     return res.json({
       success: true,
-      action: getPayUEndpoint(req),
-      isConfigured: isPayUConfigured(),
+      provider: "razorpay",
+      keyId: rzpOrder.keyId,
+      orderId: rzpOrder.orderId,
+      amount: rzpOrder.amount,
+      currency: rzpOrder.currency,
       orderNumber,
       txnid,
-      orderId: newOrder._id,
+      orderDatabaseId: newOrder._id,
+      customer: {
+        name: customer.fullName || customer.name || "Customer",
+        email,
+        phone: cleanedPhone,
+      },
       verifiedSummary: {
         subtotal: verified.verifiedSubtotal,
         discount: verified.verifiedDiscount,
@@ -412,20 +442,6 @@ export async function initiateOrderPayment(req, res) {
         gstAmount: verified.gstAmount,
         shipping: verified.verifiedShipping,
         total: verified.verifiedTotal,
-      },
-      params: {
-        key: process.env.PAYU_KEY || "TEST_KEY",
-        txnid,
-        amount: Number(verified.verifiedTotal).toFixed(2),
-        productinfo,
-        firstname,
-        email,
-        phone: cleanedPhone,
-        surl,
-        furl,
-        hash,
-        udf1: orderNumber,
-        udf2: "order",
       },
     });
   } catch (error) {
@@ -437,25 +453,34 @@ export async function initiateOrderPayment(req, res) {
 }
 
 /**
- * Verify PayU payment for Product Order Checkout
+ * Verify Razorpay payment for Product Order Checkout
  */
 export async function verifyOrderPayment(req, res) {
   try {
     await connectDB();
     const data = req.body || {};
-    const { txnid, orderNumber, status } = data;
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      txnid,
+      orderNumber,
+    } = data;
 
-    if (!txnid && !orderNumber) {
+    if (!txnid && !orderNumber && !razorpay_order_id) {
       return res.status(400).json({
         success: false,
         error: "Missing transaction ID or order number",
       });
     }
 
-    const filter = orderNumber
-      ? { orderNumber }
-      : { paymentReference: txnid };
-    const order = await Order.findOne(filter);
+    const order = await Order.findOne({
+      $or: [
+        ...(orderNumber ? [{ orderNumber }] : []),
+        ...(txnid ? [{ paymentReference: txnid }] : []),
+        ...(razorpay_order_id ? [{ paymentReference: razorpay_order_id }] : []),
+      ],
+    });
 
     if (!order) {
       return res
@@ -464,36 +489,59 @@ export async function verifyOrderPayment(req, res) {
     }
 
     if (order.paymentStatus === "paid") {
+      const redirectUrl =
+        process.env.ORDER_SUCCESS_URL ||
+        `${getFrontendUrl()}/orders?orderId=${order.orderNumber}&placed=true`;
       return res.json({
         success: true,
         message: "Order payment already verified",
         order,
+        redirectUrl,
       });
     }
 
-    const isValid = verifyPayUResponse(data);
-    if (!isValid && status !== "success") {
+    const isValid = verifyRazorpaySignature({
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    });
+
+    if (!isValid) {
       order.paymentStatus = "failed";
       await order.save();
+      const redirectUrl = getPaymentFailureUrl({
+        type: "order",
+        status: "failed",
+        orderId: order.orderNumber,
+        error: "Payment verification failed",
+      });
       return res
         .status(400)
-        .json({ success: false, error: "Payment verification failed" });
+        .json({ success: false, error: "Payment verification failed", redirectUrl });
     }
 
     order.paymentStatus = "paid";
     order.status = "confirmed";
-    order.paymentReference =
-      data.payuMoneyId || data.mihpayid || data.bank_ref_num || txnid;
+    order.paidAmount = order.total;
+    order.dueAmount = 0;
+    order.paymentType = "full";
+    order.paymentProvider = "online";
+    order.paymentReference = razorpay_payment_id || razorpay_order_id || txnid;
     await order.save();
 
     if (order.coupon) {
       await Coupon.updateOne({ code: order.coupon }, { $inc: { usedCount: 1 } });
     }
 
+    const redirectUrl =
+      process.env.ORDER_SUCCESS_URL ||
+      `${getFrontendUrl()}/orders?orderId=${order.orderNumber}&placed=true`;
+
     return res.json({
       success: true,
       message: "Payment successfully verified! Order confirmed.",
       order,
+      redirectUrl,
     });
   } catch (error) {
     console.error("verifyOrderPayment error:", error);
@@ -739,153 +787,186 @@ export async function recordAdminEnrollmentPayment(req, res) {
 }
 
 /**
- * Handle PayU callback/webhook/redirect (POST from PayU)
+ * Unified General Payment Verification endpoint
  */
-export async function handlePayUResponse(req, res) {
+export async function verifyGeneralPayment(req, res) {
+  try {
+    await connectDB();
+    const data = req.body || {};
+    const {
+      type,
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      reference,
+      orderNumber,
+      enrollmentId,
+      donationId,
+    } = data;
+
+    const isValid = verifyRazorpaySignature({
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    });
+
+    if (!isValid) {
+      return res.status(400).json({
+        success: false,
+        error: "Payment signature verification failed",
+        redirectUrl: getPaymentFailureUrl({ type, error: "signature_invalid" }),
+      });
+    }
+
+    // 1. Order
+    if (type === "order" || orderNumber) {
+      const ord = await Order.findOne({
+        $or: [
+          ...(orderNumber ? [{ orderNumber }] : []),
+          ...(reference ? [{ orderNumber: reference }] : []),
+          ...(razorpay_order_id ? [{ paymentReference: razorpay_order_id }] : []),
+        ],
+      });
+      if (ord) {
+        ord.paymentStatus = "paid";
+        ord.status = "confirmed";
+        ord.paidAmount = ord.total;
+        ord.dueAmount = 0;
+        ord.paymentType = "full";
+        ord.paymentProvider = "online";
+        ord.paymentReference = razorpay_payment_id;
+        await ord.save();
+        return res.json({
+          success: true,
+          redirectUrl: getPaymentSuccessUrl({
+            type: "order",
+            status: "success",
+            orderId: ord.orderNumber,
+            txnid: razorpay_payment_id,
+          }),
+        });
+      }
+    }
+
+    // 2. Appointment
+    if (type === "appointment" || String(reference || "").startsWith("BSV-APT")) {
+      const apt = await Consultation.findOne({
+        $or: [
+          ...(reference ? [{ reference }] : []),
+          ...(razorpay_order_id ? [{ paymentReference: razorpay_order_id }] : []),
+        ],
+      });
+      if (apt) {
+        apt.paymentStatus = "paid";
+        apt.paymentProvider = "online";
+        apt.paymentReference = razorpay_payment_id;
+        apt.status = "pending";
+        await apt.save();
+        return res.json({
+          success: true,
+          redirectUrl: getPaymentSuccessUrl({
+            type: "appointment",
+            status: "success",
+            reference: apt.reference,
+            amount: apt.amount,
+            service: apt.type,
+            txnid: razorpay_payment_id,
+          }),
+        });
+      }
+    }
+
+    // 3. Training
+    if (type === "training" || enrollmentId || String(reference || "").startsWith("BSV-ENR")) {
+      const enr = await Enrollment.findOne({
+        $or: [
+          ...(enrollmentId ? [{ enrollmentId }] : []),
+          ...(reference ? [{ enrollmentId: reference }] : []),
+          ...(razorpay_order_id ? [{ paymentReference: razorpay_order_id }] : []),
+        ],
+      });
+      if (enr) {
+        enr.paymentStatus = "paid";
+        enr.paidAmount = enr.amount;
+        enr.dueAmount = 0;
+        enr.paymentType = "full";
+        enr.paymentProvider = "online";
+        enr.paymentReference = razorpay_payment_id;
+        await enr.save();
+        return res.json({
+          success: true,
+          redirectUrl: getPaymentSuccessUrl({
+            type: "training",
+            status: "success",
+            enrollmentId: enr.enrollmentId,
+            course: enr.courseTitle,
+            txnid: razorpay_payment_id,
+          }),
+        });
+      }
+    }
+
+    // 4. Donation
+    if (type === "donation" || donationId || String(reference || "").startsWith("BSV-NGO")) {
+      const don = await Donation.findOne({
+        $or: [
+          ...(donationId ? [{ donationId }] : []),
+          ...(reference ? [{ donationId: reference }] : []),
+          ...(razorpay_order_id ? [{ paymentReference: razorpay_order_id }] : []),
+        ],
+      });
+      if (don) {
+        don.paymentStatus = "paid";
+        don.paymentProvider = "online";
+        don.paymentReference = razorpay_payment_id;
+        await don.save();
+        return res.json({
+          success: true,
+          redirectUrl: getPaymentSuccessUrl({
+            type: "donation",
+            status: "success",
+            donationId: don.donationId,
+            amount: don.amount,
+            txnid: razorpay_payment_id,
+          }),
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      redirectUrl: getPaymentSuccessUrl({ status: "success", txnid: razorpay_payment_id }),
+    });
+  } catch (err) {
+    console.error("verifyGeneralPayment error:", err);
+    return res.status(500).json({
+      success: false,
+      error: "Server error verifying payment",
+      redirectUrl: getPaymentFailureUrl({ error: "server_error" }),
+    });
+  }
+}
+
+/**
+ * Handle generic webhook / response
+ */
+export async function handlePaymentResponse(req, res) {
   try {
     await connectDB();
     const data = req.body || {};
     const { txnid, status, udf1, udf2 } = data;
-    const getFrontendUrl = () => {
-      if (process.env.FRONTEND_URL) return process.env.FRONTEND_URL.replace(/\/$/, "");
-      if (process.env.CORS_ORIGIN && process.env.CORS_ORIGIN !== "*") {
-        return process.env.CORS_ORIGIN.split(",")[0].trim().replace(/\/$/, "");
-      }
-      return "https://vastu-user.vercel.app";
-    };
-    const frontendUrl = getFrontendUrl();
 
-    console.log("Received PayU callback:", { txnid, status, udf1, udf2 });
+    const isSuccess = (status === "success" || status === "captured");
 
-    const isValid = verifyPayUResponse(data);
-    const isSuccess = (status === "success");
-
-    // 1. Donation check
-    if (udf2 === "donation" || (!udf2 && String(udf1 || "").startsWith("BSV-NGO"))) {
-      const donation = await Donation.findOne({
-        $or: [{ txnid }, { donationId: udf1 }],
-      });
-
-      if (donation) {
-        if (isSuccess) {
-          donation.paymentStatus = "paid";
-          donation.paymentReference = data.payuMoneyId || data.mihpayid || data.bank_ref_num || txnid;
-          await donation.save();
-
-          return res.redirect(
-            `${frontendUrl}/payment-success?type=donation&status=success&donationId=${donation.donationId}&txnid=${txnid}&amount=${donation.amount}`
-          );
-        } else {
-          donation.paymentStatus = "failed";
-          await donation.save();
-
-          return res.redirect(
-            `${frontendUrl}/payment-failure?type=donation&txnid=${txnid}&error=${encodeURIComponent(data.error_Message || "Payment was not completed")}`
-          );
-        }
-      }
-    }
-
-    // 2. Training check
-    if (udf2 === "training" || (!udf2 && String(udf1 || "").startsWith("BSV-ENR"))) {
-      const enrollment = await Enrollment.findOne({
-        $or: [{ txnid }, { enrollmentId: udf1 }],
-      });
-
-      if (enrollment) {
-        if (isSuccess) {
-          enrollment.paymentStatus = "paid";
-          enrollment.paidAmount = enrollment.amount;
-          enrollment.dueAmount = 0;
-          enrollment.paymentType = "full";
-          enrollment.paymentReference = data.payuMoneyId || data.mihpayid || data.bank_ref_num || txnid;
-          await enrollment.save();
-
-          return res.redirect(
-            `${frontendUrl}/payment-success?type=training&status=success&enrollmentId=${enrollment.enrollmentId}&txnid=${txnid}&course=${encodeURIComponent(enrollment.courseTitle)}`
-          );
-        } else {
-          enrollment.paymentStatus = "failed";
-          await enrollment.save();
-
-          return res.redirect(
-            `${frontendUrl}/payment-failure?type=training&txnid=${txnid}&error=${encodeURIComponent(data.error_Message || "Payment was not completed")}`
-          );
-        }
-      }
-    }
-
-    // 3. Appointment check
-    if (udf2 === "appointment" || (!udf2 && String(udf1 || "").startsWith("BSV-APT"))) {
-      const consultation = await Consultation.findOne({
-        $or: [{ txnid }, { reference: udf1 }],
-      });
-
-      if (consultation) {
-        if (isSuccess) {
-          consultation.paymentStatus = "paid";
-          consultation.status = "pending";
-          consultation.paymentReference = data.payuMoneyId || data.mihpayid || data.bank_ref_num || txnid;
-          await consultation.save();
-
-          return res.redirect(
-            `${frontendUrl}/payment-success?type=appointment&status=success&reference=${consultation.reference}&amount=${consultation.amount}&service=${encodeURIComponent(consultation.type)}&txnid=${txnid}`
-          );
-        } else {
-          consultation.paymentStatus = "failed";
-          await consultation.save();
-
-          return res.redirect(
-            `${frontendUrl}/payment-failure?type=appointment&txnid=${txnid}&error=${encodeURIComponent(data.error_Message || "Payment was not completed")}`
-          );
-        }
-      }
-    }
-
-    // 4. Order check
-    const order = await Order.findOne({
-      $or: [{ orderNumber: udf1 }, { paymentReference: txnid }],
-    });
-
-    if (order) {
-      if (isSuccess) {
-        order.paymentStatus = "paid";
-        order.status = "confirmed";
-        order.paidAmount = order.total;
-        order.dueAmount = 0;
-        order.paymentType = "full";
-        order.paymentReference = data.payuMoneyId || data.mihpayid || data.bank_ref_num || txnid;
-        await order.save();
-
-        return res.redirect(
-          `${frontendUrl}/payment-success?type=order&status=success&orderId=${order.orderNumber}&txnid=${txnid}`
-        );
-      } else {
-        order.paymentStatus = "failed";
-        await order.save();
-
-        return res.redirect(
-          `${frontendUrl}/payment-failure?type=order&txnid=${txnid}&error=${encodeURIComponent(data.error_Message || "Payment was not completed")}`
-        );
-      }
-    }
-
-    // Default redirect
     if (isSuccess) {
-      return res.redirect(`${frontendUrl}/payment-success?status=success&txnid=${txnid}`);
+      return res.redirect(getPaymentSuccessUrl({ status: "success", txnid }));
     } else {
-      return res.redirect(`${frontendUrl}/payment-failure?status=failed&txnid=${txnid}`);
+      return res.redirect(getPaymentFailureUrl({ status: "failed", txnid }));
     }
   } catch (error) {
-    console.error("handlePayUResponse error:", error);
-    const getFrontendUrl = () => {
-      if (process.env.FRONTEND_URL) return process.env.FRONTEND_URL.replace(/\/$/, "");
-      if (process.env.CORS_ORIGIN && process.env.CORS_ORIGIN !== "*") {
-        return process.env.CORS_ORIGIN.split(",")[0].trim().replace(/\/$/, "");
-      }
-      return "https://vastu-user.vercel.app";
-    };
-    const frontendUrl = getFrontendUrl();
-    return res.redirect(`${frontendUrl}/payment-failure?error=server_error`);
+    console.error("handlePaymentResponse error:", error);
+    return res.redirect(getPaymentFailureUrl({ error: "server_error" }));
   }
 }
+
+export const handlePayUResponse = handlePaymentResponse;
